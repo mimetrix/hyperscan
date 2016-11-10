@@ -3,12 +3,6 @@
  */
 
 
-using namespace std;
-#include <string>
-#include <vector>
-#include <set>
-
-
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -21,6 +15,11 @@ using namespace std;
 #include <arpa/inet.h>
 #include <pcap.h>
 #include <hs.h>
+
+#include <string>
+#include <vector>
+#include <set>
+using namespace std;
 
 
 pcap_t        *gPCAP_Handle = NULL;
