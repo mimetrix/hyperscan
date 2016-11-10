@@ -419,7 +419,7 @@ static void PCAP_CB(unsigned char *p_arg,
             inet_ntop(AF_INET, &l3->ip_src, sip, sizeof(sip));
             inet_ntop(AF_INET, &l3->ip_dst, dip, sizeof(dip));
                 // NOTE: SPORT/DPORT match in UDP and TCP, so just fudge this
-            fprintf(stdout, "{ \"Hyperscan\": { \"SourceIP\": \"%s\", \"DestinationIP\": \"%s\", \"SourcePort\": \"%u\", \"DestinationPort\": \"%u\", \"Protocol\": \"%s\", \"MatchRules\": [", sip, dip, ntohs(l4->source), ntohs(l4->dest), (l3->ip_p == IPPROTO_TCP) ? "TCP" : "UDP");
+            fprintf(stdout, "{ \"Hyperscan\": { \"SourceIP\": \"%s\", \"DestinationIP\": \"%s\", \"SourcePort\": \"%u\", \"DestinationPort\": \"%u\", \"Protocol\": \"%s\", \"MatchRules\": [", sip, dip, ntohs(l4->uh_sport), ntohs(l4->uh_dport), (l3->ip_p == IPPROTO_TCP) ? "TCP" : "UDP");
             for (const auto &match : matches)
             {
                 if (first_time)
