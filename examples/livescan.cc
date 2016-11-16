@@ -471,7 +471,7 @@ static void PCAP_CB(unsigned char *p_arg,
             strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H-%M-%S", &pkt_tm);
             
                 // NOTE: SPORT/DPORT match in UDP and TCP, so just fudge this
-            fprintf(stdout, "{ \"regex\": { \"timestamp\": \"%s.%lu UTC\", \"ipv4\": { \"srcAddr\": \"%s\", \"dstAddr\": \"%s\" }, \"%s\": { \"srcPort\": \"%u\", \"dstPort\": \"%u\"}, \"rules\": [", timestamp, p_header->ts.tv_usec, sip, dip, (l3->ip_p == IPPROTO_TCP) ? "tcp" : "udp", ntohs(l4->uh_sport), ntohs(l4->uh_dport));
+            fprintf(stdout, "{ \"regex\": { \"timestamp\": \"%s.%lu UTC\", \"ipv4\": { \"srcAddr\": \"%s\", \"dstAddr\": \"%s\" }, \"%s\": { \"srcPort\": \"%u\", \"dstPort\": \"%u\"}, \"rules\": [", timestamp, (unsigned long)p_header->ts.tv_usec, sip, dip, (l3->ip_p == IPPROTO_TCP) ? "tcp" : "udp", ntohs(l4->uh_sport), ntohs(l4->uh_dport));
 
             first_time = true;
             for (const auto &match_rule : matches_rules)
