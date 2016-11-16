@@ -8,25 +8,42 @@
 #include <stdio.h>
 #include <signal.h>
 #include <string.h>
+#include <fcntl.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 #include <net/ethernet.h>
 #include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <pcap.h>
 #include <hs.h>
 
 #include <string>
 #include <vector>
 #include <set>
+#include <map>
 using namespace std;
 
 
-pcap_t        *gPCAP_Handle = NULL;
-hs_database_t *gHS_DB = NULL;
-hs_scratch_t  *gHS_Scratch = NULL;
-char          *gRules_Filename = NULL;
-bool           gRules_Reload = false;
+typedef struct _context
+{
+    const unsigned char *s_buffer;
+    set<unsigned int>   *s_rules;
+    set<string>         *s_strings;
+} CONTEXT;
+
+
+pcap_t                 *gPCAP_Handle = NULL;
+unsigned int            gPCAP_Snaplen = 0;
+unsigned int            gPCAP_Datalink = 0;
+hs_database_t          *gHS_DB = NULL;
+hs_scratch_t           *gHS_Scratch = NULL;
+char                   *gRules_Filename = NULL;
+bool                    gRules_Reload = false;
+bool                    gSave_Strings = false;
+char                   *gSave_PCAPs = NULL;
+map<unsigned int, int>  gOutput_PCAPs;
 
 
 /* Signal handler function for SIGINT - allow for clean shutdown */
@@ -116,8 +133,18 @@ static bool Parse_Rules_File(vector<unsigned int> &p_ids,
             // Terimate flags
         *pos3 = '\0';
 
-            // Build up the flags
-        flags = 0;
+            // Initialize the flags
+        if (gSave_Strings)
+        {
+                // In this mode, keep left-most pointer (COSTLY!)
+            flags = HS_FLAG_SOM_LEFTMOST;
+        }
+        else
+        {
+                // In this mode, only bother to match a rule once...
+            flags = HS_FLAG_SINGLEMATCH;
+        }
+        
         while (*pos2)
         {
                 // Parse legal flags
@@ -266,11 +293,17 @@ static int HS_CB(unsigned int p_id,
                  unsigned int p_flags,
                  void *p_ctx)
 {
-    set<unsigned int> *matches = (set<unsigned int> *)p_ctx;
     
 
         // Save that we hit this ID (set so duplicates are suppressed)
-    matches->insert(p_id);
+    ((CONTEXT *)p_ctx)->s_rules->insert(p_id);
+
+        // Only save strings if the flag is set
+    if (gSave_Strings)
+    {
+        printf("--- ID: %u FROM: %llu TO:%llu FLAGS: %0x\n", p_id, p_from, p_to, p_flags);
+        ((CONTEXT *)p_ctx)->s_strings->insert(string((const char *)&((CONTEXT *)p_ctx)->s_buffer[p_from], (p_to-p_from)));
+    }
     
     return(0);
 } /* HS_CB() */
@@ -382,18 +415,29 @@ static void PCAP_CB(unsigned char *p_arg,
                     const struct pcap_pkthdr *p_header,
                     const unsigned char *p_packet)
 {
-    const unsigned char       *data = (const unsigned char *)p_packet;
+    const unsigned char     *data = (const unsigned char *)p_packet;
         //const struct ether_header *l2 = (const struct ether_header *)p_packet;
-    const struct ip           *l3 = NULL;
-    const struct udphdr       *l4 = NULL;
-    unsigned int               length = p_header->len;
-    set<unsigned int>          matches;
-    hs_error_t                 err;
-    bool                       first_time = true;
-    char                       sip[64];
-    char                       dip[64];
+    const struct ip         *l3 = NULL;
+    const struct udphdr     *l4 = NULL;
+    unsigned int             length = p_header->caplen;
+    set<unsigned int>        matches_rules;
+    set<string>              matches_strings;
+    CONTEXT                  match_context;
+    hs_error_t               err;
+    bool                     first_time;
+    char                     timestamp[64];
+    char                     sip[64];
+    char                     dip[64];
+    struct tm                pkt_tm;
+    struct pcap_file_header  file_header = { 0xa1b2c3d4, PCAP_VERSION_MAJOR, PCAP_VERSION_MINOR, 0, 0, gPCAP_Snaplen, gPCAP_Datalink };
+    int                      fd = -1;
+    string                   output_filename;
+    char                     buffer[16];
+    uint32_t                 packet_header[4] = { (uint32_t)p_header->ts.tv_sec,
+                                                  (uint32_t)p_header->ts.tv_usec,
+                                                  p_header->caplen,
+                                                  p_header->len};
     
-
         // First check if we were signaled to reload our rules
     if (gRules_Reload)
     {
@@ -405,21 +449,32 @@ static void PCAP_CB(unsigned char *p_arg,
     if (Find_Packet_Payload(&data, &length, (const unsigned char **)&l3,
                             (const unsigned char **)&l4))
     {
+            // Prep Context
+        match_context.s_buffer = data;
+        match_context.s_rules = &matches_rules;
+        match_context.s_strings = &matches_strings;
+        
             // Valid packet to scan
         if ((err = hs_scan(gHS_DB, (const char *)data, length, 0,
-                           gHS_Scratch, HS_CB, &matches)) != HS_SUCCESS)
+                           gHS_Scratch, HS_CB, &match_context)) != HS_SUCCESS)
         {
                 /* Errr.....WTF? */
             fprintf(stderr, "Hyperscan error: %d\n", err);
         }
-        else if (!matches.empty())
+        else if (!matches_rules.empty() ||
+                 (gSave_Strings && !matches_strings.empty()))
         {
                 // Only bother if we matched 1 or more terms
             inet_ntop(AF_INET, &l3->ip_src, sip, sizeof(sip));
             inet_ntop(AF_INET, &l3->ip_dst, dip, sizeof(dip));
+            gmtime_r(&p_header->ts.tv_sec, &pkt_tm);
+            strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H-%M-%S", &pkt_tm);
+            
                 // NOTE: SPORT/DPORT match in UDP and TCP, so just fudge this
-            fprintf(stdout, "{ \"Hyperscan\": { \"SourceIP\": \"%s\", \"DestinationIP\": \"%s\", \"SourcePort\": \"%u\", \"DestinationPort\": \"%u\", \"Protocol\": \"%s\", \"MatchRules\": [", sip, dip, ntohs(l4->uh_sport), ntohs(l4->uh_dport), (l3->ip_p == IPPROTO_TCP) ? "TCP" : "UDP");
-            for (const auto &match : matches)
+            fprintf(stdout, "{ \"regex\": { \"timestamp\": \"%s.%lu UTC\", \"ipv4\": { \"srcAddr\": \"%s\", \"dstAddr\": \"%s\" }, \"%s\": { \"srcPort\": \"%u\", \"dstPort\": \"%u\"}, \"rules\": [", timestamp, p_header->ts.tv_usec, sip, dip, (l3->ip_p == IPPROTO_TCP) ? "tcp" : "udp", ntohs(l4->uh_sport), ntohs(l4->uh_dport));
+
+            first_time = true;
+            for (const auto &match_rule : matches_rules)
             {
                 if (first_time)
                 {
@@ -429,9 +484,77 @@ static void PCAP_CB(unsigned char *p_arg,
                 {
                     fprintf(stdout, ", ");
                 }
-                fprintf(stdout, "\"%u\"", match);
+                fprintf(stdout, "\"%u\"", match_rule);
+
+                    // See if we need to save a copy of the packet
+                if (gSave_PCAPs)
+                {
+                    if (gOutput_PCAPs.find(match_rule) != gOutput_PCAPs.end())
+                    {
+                        fd = gOutput_PCAPs[match_rule];
+                    }
+                    else
+                    {
+                        snprintf(buffer, sizeof(buffer), "%u", match_rule);
+                        output_filename = gSave_PCAPs;
+                        output_filename += ".";
+                        output_filename += buffer;
+                        output_filename += ".cap";
+                        
+                        if ((fd = open(output_filename.c_str(),
+                                        O_RDWR|O_CREAT|O_TRUNC,
+                                        S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH|S_IWOTH)) == -1)
+                        {
+                            fprintf(stderr, "Failed to open PCAP output file '%s'!\n",
+                                    output_filename.c_str());
+                        }
+                        else
+                        {
+                            if (write(fd, &file_header, sizeof(file_header)) != sizeof(file_header))
+                            {
+                                fprintf(stderr, "Failed to write PCAP output file header for '%s'!\n",
+                                        output_filename.c_str());
+                                close(fd);
+                                fd = -1;
+                            }
+                            else
+                            {
+                                gOutput_PCAPs[match_rule] = fd;
+                            }
+                        }
+                    }
+                    if (fd != -1)
+                    {
+                        if ((write(fd, packet_header, sizeof(packet_header)) != sizeof(packet_header)) ||
+                            (write(fd, p_packet, p_header->caplen) != p_header->caplen))
+                        {
+                            fprintf(stderr, "Failed to write packet to PCAP output file, file may be mangled!\n");
+                        }
+                    }
+                }
             }
-            fprintf(stdout, "] } }\n");
+            fprintf(stdout, "]");
+            
+            if (gSave_Strings)
+            {
+                first_time = true;
+                fprintf(stdout, ", \"strings\": [");
+                
+                for (const auto &match_string : matches_strings)
+                {
+                    if (first_time)
+                    {
+                        first_time = false;
+                    }
+                    else
+                    {
+                        fprintf(stdout, ", ");
+                    }
+                    fprintf(stdout, "\"%s\"", match_string.c_str());
+                }
+                fprintf(stdout, "]");
+            }
+            fprintf(stdout, " } }\n");
         }
     }
 } /* PCAP_CB() */
@@ -440,9 +563,10 @@ static void PCAP_CB(unsigned char *p_arg,
 int main(int argc,
          char **argv)
 {
-    char   *interface = NULL;
-    int     opt;
-    char    err[PCAP_ERRBUF_SIZE];
+    char *interface = NULL;
+    char *pcap_filename = NULL;
+    int   opt;
+    char  err[PCAP_ERRBUF_SIZE];
     
 
         // Need to be root to promiscuous capture
@@ -452,10 +576,19 @@ int main(int argc,
         exit(-1);
     }
     
-    while ((opt = getopt(argc, argv, "i:r:h?")) != -1)
+    while ((opt = getopt(argc, argv, "f:hi:o:r:s?")) != -1)
     {
         switch (opt)
         {
+        case 'f': /* File */
+            if (pcap_filename)
+            {
+                fprintf(stderr, "Duplicate filename specifiers not allowed!\n");
+                exit(-1);
+            }
+            pcap_filename = strdup(optarg);
+            break;
+            
         case 'i': /* Interface */
             if (interface)
             {
@@ -465,6 +598,15 @@ int main(int argc,
             interface = strdup(optarg);
             break;
 
+        case 'o': /* Output PCAP files */
+            if (gSave_PCAPs)
+            {
+                fprintf(stderr, "Duplicate output PCAP save file prefix not allowed!\n");
+                exit(-1);
+            }
+            gSave_PCAPs = strdup(optarg);
+            break;
+            
         case 'r': /* Rules */
             if (gRules_Filename)
             {
@@ -473,11 +615,15 @@ int main(int argc,
             }
             gRules_Filename = strdup(optarg);
             break;
+
+        case 's': /* Strings Output */
+            gSave_Strings = true;
+            break;
             
         case 'h': /* Help */
         case '?': /* Help */
         default:
-            fprintf(stderr, "Usage: %s [-i <interface_name>] -r <rules_file>\n",
+            fprintf(stderr, "Usage: %s {-f <pcap_file> | -i <interface_name>} -r <rules_file> [-s]\n",
                     argv[0]);
             exit(-1);
         }
@@ -504,23 +650,46 @@ int main(int argc,
         exit(-1);
     }
 
-        // If we weren't given an interface, grab PCAP's default
-    if (!interface)
+        // If we have a file and an interface, barf
+    if (pcap_filename && interface)
     {
-        if (!(interface = strdup(pcap_lookupdev(err))))
+        fprintf(stderr, "Cannot specify both a pcap_file (-f) and an interface (-i) at the same time!\n");
+        exit(-1);
+    }
+
+    if (pcap_filename)
+    {
+        if (!(gPCAP_Handle = pcap_open_offline(pcap_filename, err)))
         {
-            fprintf(stderr, "PCAP inteface lookup error: %s\n", err);
+            fprintf(stderr, "Failed to open PCAP file '%s' for reading: %s\n",
+                    pcap_filename, err);
+            exit(-1);
+        }
+    }
+    else
+    {
+            // If we weren't given an interface, grab PCAP's default
+        if (!interface)
+        {
+            if (!(interface = strdup(pcap_lookupdev(err))))
+            {
+                fprintf(stderr, "PCAP inteface lookup error: %s\n", err);
+                exit(-1);
+            }
+        }
+        
+            // Open up the interface for promiscuous capture
+        if (!(gPCAP_Handle = pcap_open_live(interface, 1600, 1, 10, err)))
+        {
+            fprintf(stderr, "PCAP live capture error: %s\n", err);
             exit(-1);
         }
     }
 
-        // Open up the interface for promiscuous capture
-    if (!(gPCAP_Handle = pcap_open_live(interface, 1600, 1, 10, err)))
-    {
-        fprintf(stderr, "PCAP live capture error: %s\n", err);
-        exit(-1);
-    }
-
+        // Squirl away for if we need to save files
+    gPCAP_Snaplen = pcap_snapshot(gPCAP_Handle);
+    gPCAP_Datalink = pcap_datalink(gPCAP_Handle);
+    
         // Register SIGINT to interrupt the pcap_loop() call to follow
     if (signal(SIGINT, Interrupt_SIGINT) == SIG_ERR)
     {
@@ -531,9 +700,26 @@ int main(int argc,
         // Process packets until we're interrupted by SIGINT...
     pcap_loop(gPCAP_Handle, 0, PCAP_CB, NULL);
     
+        // Close down any open file descripters
+    for (const auto &fd : gOutput_PCAPs)
+    {
+        close(fd.second);
+    }
+
         // Cleanup
     hs_free_database(gHS_DB);
-    free(interface);
+    if (interface)
+    {
+        free(interface);
+    }
+    if (pcap_filename)
+    {
+        free(pcap_filename);
+    }
+    if (gSave_PCAPs)
+    {
+        free(gSave_PCAPs);
+    }
     free(gRules_Filename);
 
         // Exit stage left...
